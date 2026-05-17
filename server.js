@@ -1,5 +1,5 @@
 const express = require('express');
-const mysql = require('mysql2');
+const { Pool } = require('pg');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
@@ -11,25 +11,52 @@ require('dotenv').config();
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+    origin: [
+        "http://localhost:3000",   // React local
+        "http://localhost:5173",   // Vite local
+        "https://oravista.vercel.app", // Deployment preview
+        "https://oravista.site"
+    ],
+    credentials: true,
+    methods: ["*"],
+    allowedHeaders: ["*"]
+}));
 app.use(express.json());
-
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
+    try {
+        fs.mkdirSync(uploadDir, { recursive: true });
+    } catch (err) {
+        console.error("Failed to create uploads directory:", err);
+    }
 }
 
+app.use('/uploads', (req, res, next) => {
+    const filePath = path.join(uploadDir, req.path);
+    if (!fs.existsSync(filePath)) {
+        console.warn(`[WARN] File not found: ${filePath}`);
+        return res.status(404).send('File not found');
+    }
+    next();
+}, express.static(uploadDir));
+
 // ---------------------------------------------------------
-// DATABASE CONNECTION (XAMPP / MariaDB)
+// DATABASE CONNECTION (PostgreSQL / Supabase)
 // ---------------------------------------------------------
-const db = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    password: '',
-    database: 'oravista_db'
+const db = new Pool({
+    connectionString: `postgresql://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT}/${process.env.POSTGRES_DATABASE}?sslmode=require`,
 });
+
+db.connect()
+    .then(client => {
+        console.log('✅ Connected to PostgreSQL Database');
+        client.release();
+    })
+    .catch(err => {
+        console.error('❌ Database connection error', err.stack);
+    });
 
 // ---------------------------------------------------------
 // EMAIL TRANSPORTER SETUP
@@ -85,7 +112,7 @@ app.post('/api/signup', async (req, res) => {
     }
 
     try {
-        const [existingUser] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+        const { rows: existingUser } = await db.query('SELECT * FROM users WHERE email = $1', [email]);
         if (existingUser.length > 0) {
             return res.status(400).json({ message: "Email already registered." });
         }
@@ -96,8 +123,8 @@ app.post('/api/signup', async (req, res) => {
         const userRole = role || 'patient';
         const userBranch = branch || 'Main Branch';
 
-        const query = 'INSERT INTO users (first_name, last_name, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-        await db.promise().query(query, [firstName, lastName, email, hashedPassword, userRole, phone || null, dob || null, userBranch]);
+        const query = 'INSERT INTO users (first_name, last_name, email, password, role, phone, dob, branch) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)';
+        await db.query(query, [firstName, lastName, email, hashedPassword, userRole, phone || null, dob || null, userBranch]);
 
         res.status(201).json({ message: "Account created successfully!" });
     } catch (err) {
@@ -114,7 +141,7 @@ app.post('/api/admin/create-user', async (req, res) => {
 
     try {
         // Check if email exists
-        const [existingUser] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+        const { rows: existingUser } = await db.query('SELECT * FROM users WHERE email = $1', [email]);
         if (existingUser.length > 0) {
             return res.status(400).json({ message: "Email already registered." });
         }
@@ -126,10 +153,10 @@ app.post('/api/admin/create-user', async (req, res) => {
         // Insert into database including specialty and status
         const query = `
             INSERT INTO users (first_name, last_name, email, password, role, phone, branch, specialty, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Available')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Available')
         `;
 
-        await db.promise().query(query, [firstName, lastName, email, hashedPassword, role, phone || null, branch, specialty || null]);
+        await db.query(query, [firstName, lastName, email, hashedPassword, role, phone || null, branch, specialty || null]);
 
         res.status(201).json({ message: "Staff/Dentist account created successfully!" });
     } catch (err) {
@@ -143,7 +170,7 @@ app.post('/api/login', async (req, res) => {
 
     try {
         // 1. Fetch User
-        const [users] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+        const { rows: users } = await db.query('SELECT * FROM users WHERE email = $1', [email]);
 
         // Log for debugging: See if the email even exists in the DB
         console.log(`Login attempt for: ${email}`);
@@ -197,7 +224,7 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/check-email', async (req, res) => {
     const { email } = req.body;
     try {
-        const [users] = await db.promise().query('SELECT first_name FROM users WHERE email = ?', [email]);
+        const { rows: users } = await db.query('SELECT first_name FROM users WHERE email = $1', [email]);
         if (users.length > 0) res.status(200).json({ firstName: users[0].first_name });
         else res.status(404).json({ message: "Email not found" });
     } catch (err) {
@@ -210,7 +237,7 @@ app.put('/api/reset-password-by-email', async (req, res) => {
     try {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(newPassword, salt);
-        await db.promise().query('UPDATE users SET password = ? WHERE email = ?', [hashedPassword, email]);
+        await db.query('UPDATE users SET password = $1 WHERE email = $2', [hashedPassword, email]);
         res.status(200).json({ message: "Password updated successfully!" });
     } catch (err) {
         res.status(500).json({ message: "Server error." });
@@ -224,7 +251,7 @@ app.post('/api/send-otp', async (req, res) => {
     const { email, action } = req.body;
 
     try {
-        const [users] = await db.promise().query('SELECT first_name FROM users WHERE email = ?', [email]);
+        const { rows: users } = await db.query('SELECT first_name FROM users WHERE email = $1', [email]);
         if (users.length === 0) {
             return res.status(404).json({ message: "Email not found in our system." });
         }
@@ -265,10 +292,10 @@ app.post('/api/send-otp', async (req, res) => {
         };
 
         // Check if the system is running in development mode
-        if (process.env.ENVIRONMENT === 'dev') {
+        if (process.env.ENVIRONMENT === 'local') {
             console.log(`\n[DEV MODE] Bypass active. OTP for ${email} is: ${otp}\n`);
         } else {
-            // Live email delivery only runs in production
+            // Live email delivery for dev and production
             await transporter.sendMail(mailOptions);
         }
 
@@ -295,10 +322,10 @@ app.put('/api/update-profile', async (req, res) => {
     const safeDob = dob === '' ? null : dob;
 
     try {
-        const query = `UPDATE users SET first_name = ?, last_name = ?, email = ?, sex = ?, dob = ?, age = ?, phone = ?, occupation = ?, blood_type = ?, allergies = ?, insurance = ?, policy_number = ? WHERE id = ?`;
+        const query = `UPDATE users SET first_name = $1, last_name = $2, email = $3, sex = $4, dob = $5, age = $6, phone = $7, occupation = $8, blood_type = $9, allergies = $10, insurance = $11, policy_number = $12 WHERE id = $13`;
 
         // Pass safeAge and safeDob to the database query
-        await db.promise().query(query, [firstName, lastName, email, sex, safeDob, safeAge, phone, occupation, blood_type, allergies, insurance, policy_number, id]);
+        await db.query(query, [firstName, lastName, email, sex, safeDob, safeAge, phone, occupation, blood_type, allergies, insurance, policy_number, id]);
 
         res.status(200).json({ message: "Profile updated successfully!" });
     } catch (err) {
@@ -310,12 +337,12 @@ app.put('/api/update-profile', async (req, res) => {
 app.put('/api/update-password', async (req, res) => {
     const { id, oldPassword, newPassword } = req.body;
     try {
-        const [users] = await db.promise().query('SELECT password FROM users WHERE id = ?', [id]);
+        const { rows: users } = await db.query('SELECT password FROM users WHERE id = $1', [id]);
         const isMatch = await bcrypt.compare(oldPassword, users[0].password);
         if (!isMatch) return res.status(401).json({ message: "Incorrect old password." });
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(newPassword, salt);
-        await db.promise().query('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, id]);
+        await db.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, id]);
         res.status(200).json({ message: "Password updated successfully!" });
     } catch (err) {
         res.status(500).json({ message: "Server error." });
@@ -332,7 +359,7 @@ app.post('/api/upload-profile-picture', upload.single('profileImage'), async (re
     const imagePath = 'uploads/' + req.file.filename;
 
     try {
-        await db.promise().query('UPDATE users SET profile_picture = ? WHERE id = ?', [imagePath, userId]);
+        await db.query('UPDATE users SET profile_picture = $1 WHERE id = $2', [imagePath, userId]);
         res.status(200).json({
             message: "Profile picture updated successfully!",
             imagePath: imagePath
@@ -358,8 +385,8 @@ app.post('/api/upload-record', uploadRecord.single('recordFile'), async (req, re
     const finalFileName = fileName || req.file.originalname;
 
     try {
-        const query = 'INSERT INTO patient_records (user_id, file_name, file_path) VALUES (?, ?, ?)';
-        await db.promise().query(query, [userId, finalFileName, filePath]);
+        const query = 'INSERT INTO patient_records (user_id, file_name, file_path) VALUES ($1, $2, $3)';
+        await db.query(query, [userId, finalFileName, filePath]);
 
         res.status(201).json({
             message: "Record uploaded successfully!",
@@ -373,8 +400,8 @@ app.post('/api/upload-record', uploadRecord.single('recordFile'), async (req, re
 
 app.get('/api/patient-records/:userId', async (req, res) => {
     try {
-        const [records] = await db.promise().query(
-            'SELECT id, file_name, file_path, upload_date FROM patient_records WHERE user_id = ? ORDER BY upload_date DESC',
+        const { rows: records } = await db.query(
+            'SELECT id, file_name, file_path, upload_date FROM patient_records WHERE user_id = $1 ORDER BY upload_date DESC',
             [req.params.userId]
         );
         res.status(200).json(records);
@@ -402,10 +429,10 @@ app.post('/api/book-appointment', async (req, res) => {
         const query = `
             INSERT INTO appointments 
             (user_id, booking_ref, service_type, dentist_name, appointment_date, appointment_time, status, amount, branch) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `;
 
-        await db.promise().query(query, [user_id, booking_ref, service_type, dentist_name, appointment_date, appointment_time, 'Pending', amountToSave, branchToSave]);
+        await db.query(query, [user_id, booking_ref, service_type, dentist_name, appointment_date, appointment_time, 'Pending', amountToSave, branchToSave]);
 
         res.status(201).json({
             message: "Appointment booked successfully!",
@@ -419,7 +446,7 @@ app.post('/api/book-appointment', async (req, res) => {
 
 app.get('/api/user-appointments/:userId', async (req, res) => {
     try {
-        const [results] = await db.promise().query('SELECT * FROM appointments WHERE user_id = ? ORDER BY appointment_date DESC', [req.params.userId]);
+        const { rows: results } = await db.query('SELECT * FROM appointments WHERE user_id = $1 ORDER BY appointment_date DESC', [req.params.userId]);
         res.status(200).json(results);
     } catch (err) {
         res.status(500).json({ message: "Failed to fetch appointments." });
@@ -429,7 +456,7 @@ app.get('/api/user-appointments/:userId', async (req, res) => {
 app.put('/api/update-appointment-status', async (req, res) => {
     const { appointment_id, status } = req.body;
     try {
-        await db.promise().query('UPDATE appointments SET status = ? WHERE id = ?', [status, appointment_id]);
+        await db.query('UPDATE appointments SET status = $1 WHERE id = $2', [status, appointment_id]);
         res.status(200).json({ message: `Appointment marked as ${status}.` });
     } catch (err) {
         res.status(500).json({ message: "Server error." });
@@ -439,7 +466,7 @@ app.put('/api/update-appointment-status', async (req, res) => {
 app.get('/api/appointments/check-availability', async (req, res) => {
     const { date, dentist } = req.query;
     try {
-        const [results] = await db.promise().query('SELECT appointment_time, service_type FROM appointments WHERE appointment_date = ? AND dentist_name = ?', [date, dentist]);
+        const { rows: results } = await db.query('SELECT appointment_time, service_type FROM appointments WHERE appointment_date = $1 AND dentist_name = $2', [date, dentist]);
         const bookedData = results.map(row => ({ time: row.appointment_time, service: row.service_type }));
         res.status(200).json(bookedData);
     } catch (err) {
@@ -453,14 +480,12 @@ app.get('/api/appointments/check-availability', async (req, res) => {
 
 app.get('/api/dashboard/stats', async (req, res) => {
     try {
-        const promiseDb = db.promise();
+        const { rows: todayRows } = await db.query("SELECT COUNT(*) as count FROM appointments WHERE DATE(appointment_date) = CURRENT_DATE");
+        const { rows: totalDentistsRows } = await db.query("SELECT COUNT(*) as count FROM users WHERE role = 'dentist'");
+        const { rows: busyDentistsRows } = await db.query(`SELECT COUNT(DISTINCT dentist_name) as count FROM appointments WHERE DATE(appointment_date) = CURRENT_DATE AND status = 'Confirmed'`);
+        const { rows: monthPatientsRows } = await db.query(`SELECT COUNT(DISTINCT user_id) as count FROM appointments WHERE EXTRACT(MONTH FROM appointment_date) = EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM appointment_date) = EXTRACT(YEAR FROM CURRENT_DATE)`);
 
-        const [todayRows] = await promiseDb.query("SELECT COUNT(*) as count FROM appointments WHERE DATE(appointment_date) = CURDATE()");
-        const [totalDentistsRows] = await promiseDb.query("SELECT COUNT(*) as count FROM users WHERE role = 'dentist'");
-        const [busyDentistsRows] = await promiseDb.query(`SELECT COUNT(DISTINCT dentist_name) as count FROM appointments WHERE DATE(appointment_date) = CURDATE() AND status = 'Confirmed'`);
-        const [monthPatientsRows] = await promiseDb.query(`SELECT COUNT(DISTINCT user_id) as count FROM appointments WHERE MONTH(appointment_date) = MONTH(CURDATE()) AND YEAR(appointment_date) = YEAR(CURDATE())`);
-
-        const [scheduleRows] = await promiseDb.query(`
+        const { rows: scheduleRows } = await db.query(`
             SELECT a.id, a.booking_ref, a.appointment_time, a.appointment_date, a.dentist_name, a.status, a.service_type,
             CONCAT(u.first_name, ' ', u.last_name) as patient_name
             FROM appointments a
@@ -498,7 +523,7 @@ app.get('/api/dashboard/branch-earnings', async (req, res) => {
             WHERE status != 'Cancelled'
             GROUP BY branch
         `;
-        const [results] = await db.promise().query(query);
+        const { rows: results } = await db.query(query);
 
         const earningsObj = {};
         results.forEach(row => {
@@ -522,7 +547,7 @@ app.get('/api/patients', async (req, res) => {
             WHERE role = 'patient' 
             ORDER BY last_name ASC
         `;
-        const [patients] = await db.promise().query(query);
+        const { rows: patients } = await db.query(query);
         res.status(200).json(patients);
     } catch (err) {
         res.status(500).json({ message: "Failed to fetch patients list." });
@@ -534,21 +559,21 @@ app.get('/api/dentists', async (req, res) => {
         const query = `
             SELECT 
                 u.id, u.first_name, u.last_name, u.specialty, u.status AS manual_status, u.branch,
-                (SELECT COUNT(*) FROM appointments a WHERE a.dentist_name LIKE CONCAT('%', u.last_name, '%')) AS patient_count,
+                (SELECT COUNT(*) FROM appointments a WHERE a.dentist_name ILIKE CONCAT('%', u.last_name, '%')) AS patient_count,
                 CASE 
                     WHEN EXISTS (
                         SELECT 1 FROM appointments a 
-                        WHERE a.dentist_name LIKE CONCAT('%', u.last_name, '%') 
-                        AND DATE(a.appointment_date) = CURDATE()
+                        WHERE a.dentist_name ILIKE CONCAT('%', u.last_name, '%') 
+                        AND DATE(a.appointment_date) = CURRENT_DATE
                         AND a.status = 'Confirmed'
                     ) THEN 'Busy'
-                    ELSE IFNULL(u.status, 'Available')
+                    ELSE COALESCE(u.status, 'Available')
                 END AS status
             FROM users u
             WHERE u.role = 'dentist'
             ORDER BY u.last_name ASC
         `;
-        const [dentists] = await db.promise().query(query);
+        const { rows: dentists } = await db.query(query);
         res.status(200).json(dentists);
     } catch (err) {
         console.error("Fetch Dentists Error:", err);
@@ -559,13 +584,11 @@ app.get('/api/dentists', async (req, res) => {
 app.get('/api/dentist-profile/:id', async (req, res) => {
     const dentistId = req.params.id;
     try {
-        const promiseDb = db.promise();
-
-        const [dentistRows] = await promiseDb.query(
+        const { rows: dentistRows } = await db.query(
             `SELECT id, first_name, last_name, email, specialty, status, phone, branch,
-            (SELECT COUNT(DISTINCT user_id) FROM appointments WHERE dentist_name LIKE CONCAT('%', last_name, '%')) as patient_count,
-            (SELECT COUNT(*) FROM appointments WHERE dentist_name LIKE CONCAT('%', last_name, '%') AND status = 'Completed') as procedures_count
-            FROM users WHERE id = ? AND role = 'dentist'`,
+            (SELECT COUNT(DISTINCT user_id) FROM appointments WHERE dentist_name ILIKE CONCAT('%', last_name, '%')) as patient_count,
+            (SELECT COUNT(*) FROM appointments WHERE dentist_name ILIKE CONCAT('%', last_name, '%') AND status = 'Completed') as procedures_count
+            FROM users WHERE id = $1 AND role = 'dentist'`,
             [dentistId]
         );
 
@@ -573,23 +596,23 @@ app.get('/api/dentist-profile/:id', async (req, res) => {
 
         const dentist = dentistRows[0];
 
-        const [patientRows] = await promiseDb.query(`
+        const { rows: patientRows } = await db.query(`
             SELECT DISTINCT u.id, CONCAT(u.first_name, ' ', u.last_name) as name, 
             a.service_type as case_type, 
             (SELECT MAX(appointment_date) FROM appointments WHERE user_id = u.id) as last_visit
             FROM users u
             JOIN appointments a ON u.id = a.user_id
-            WHERE a.dentist_name LIKE CONCAT('%', ?, '%')
+            WHERE a.dentist_name ILIKE CONCAT('%', $1, '%')
             LIMIT 5`,
             [dentist.last_name]
         );
 
-        const [scheduleRows] = await promiseDb.query(`
+        const { rows: scheduleRows } = await db.query(`
             SELECT a.appointment_time, CONCAT(u.first_name, ' ', u.last_name) as patient_name, a.service_type as type
             FROM appointments a
             LEFT JOIN users u ON a.user_id = u.id
-            WHERE a.dentist_name LIKE CONCAT('%', ?, '%') 
-            AND DATE(a.appointment_date) = CURDATE()
+            WHERE a.dentist_name ILIKE CONCAT('%', $1, '%') 
+            AND DATE(a.appointment_date) = CURRENT_DATE
             ORDER BY a.appointment_time ASC`,
             [dentist.last_name]
         );
@@ -621,10 +644,10 @@ app.post('/api/save-diagnosis', async (req, res) => {
     try {
         const query = `
             INSERT INTO ai_diagnostics (patient_id, clinical_notes, ai_findings) 
-            VALUES (?, ?, ?)
+            VALUES ($1, $2, $3)
         `;
 
-        await db.promise().query(query, [patient_id, clinical_notes, findingsJson]);
+        await db.query(query, [patient_id, clinical_notes, findingsJson]);
 
         res.status(201).json({
             status: "success",
