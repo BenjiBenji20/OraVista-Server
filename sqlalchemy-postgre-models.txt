@@ -45,6 +45,7 @@ class UserRoleEnum(enum.Enum):
     dentist = "dentist"
 
 
+
 # ---------------------------------------------------------------------------
 # PatientAnalytics
 # Table: patient_analytics
