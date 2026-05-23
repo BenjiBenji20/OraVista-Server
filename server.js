@@ -540,6 +540,48 @@ app.get('/api/dashboard/branch-earnings', async (req, res) => {
     }
 });
 
+app.get('/api/patients/search', async (req, res) => {
+    const queryStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+
+    try {
+        let queryText = '';
+        let queryParams = [];
+
+        if (queryStr !== '') {
+            queryText = `
+                SELECT * FROM users 
+                WHERE role = 'patient' 
+                  AND (first_name ILIKE $1 OR last_name ILIKE $1 OR email ILIKE $1)
+                ORDER BY last_name ASC, first_name ASC
+                LIMIT $2 OFFSET $3
+            `;
+            queryParams = [`%${queryStr}%`, limit, offset];
+        } else {
+            queryText = `
+                SELECT * FROM users 
+                WHERE role = 'patient'
+                ORDER BY last_name ASC, first_name ASC
+                LIMIT $1 OFFSET $2
+            `;
+            queryParams = [limit, offset];
+        }
+
+        const { rows: patients } = await db.query(queryText, queryParams);
+
+        // Security check: exclude sensitive password hashes before returning
+        patients.forEach(patient => {
+            delete patient.password;
+        });
+
+        res.status(200).json(patients);
+    } catch (err) {
+        console.error("❌ Error searching patients:", err);
+        res.status(500).json({ message: "Failed to search patients." });
+    }
+});
+
 app.get('/api/patients', async (req, res) => {
     try {
         const query = `
