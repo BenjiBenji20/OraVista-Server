@@ -8,8 +8,19 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    supabase = createClient(
+        process.env.SUPABASE_URL,
+        process.env.SUPABASE_SERVICE_ROLE_KEY
+    );
+} else {
+    console.warn("⚠️ Warning: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing. Supabase Storage uploads will fail.");
+}
 
 app.use(cors({
     origin: [
@@ -35,11 +46,29 @@ if (!fs.existsSync(uploadDir)) {
 
 app.use('/uploads', (req, res, next) => {
     const filePath = path.join(uploadDir, req.path);
-    if (!fs.existsSync(filePath)) {
-        console.warn(`[WARN] File not found: ${filePath}`);
-        return res.status(404).send('File not found');
+    
+    // If the file exists locally (legacy/development files), serve it
+    if (fs.existsSync(filePath)) {
+        return next();
     }
-    next();
+    
+    // Otherwise, redirect to Supabase storage if it matches the filename prefixes
+    const filename = req.path.replace(/^\//, '');
+    let bucket = '';
+    
+    if (filename.startsWith('profile_')) {
+        bucket = 'profile-photo';
+    } else if (filename.startsWith('record_')) {
+        bucket = 'file-record';
+    }
+    
+    if (bucket && process.env.SUPABASE_URL) {
+        const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${bucket}/${filename}`;
+        return res.redirect(302, publicUrl);
+    }
+    
+    console.warn(`[WARN] File not found: ${filePath}`);
+    res.status(404).send('File not found');
 }, express.static(uploadDir));
 
 // ---------------------------------------------------------
@@ -78,25 +107,9 @@ const transporter = nodemailer.createTransport({
 // ---------------------------------------------------------
 // MULTER CONFIGURATION FOR UPLOADS
 // ---------------------------------------------------------
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, 'uploads/');
-    },
-    filename: (req, file, cb) => {
-        cb(null, 'profile_' + Date.now() + path.extname(file.originalname));
-    }
-});
+const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
-
-const recordStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, 'uploads/');
-    },
-    filename: (req, file, cb) => {
-        cb(null, 'record_' + Date.now() + path.extname(file.originalname));
-    }
-});
-const uploadRecord = multer({ storage: recordStorage });
+const uploadRecord = multer({ storage: storage });
 
 
 // ---------------------------------------------------------
@@ -359,9 +372,26 @@ app.post('/api/upload-profile-picture', upload.single('profileImage'), async (re
         return res.status(400).json({ message: "No image file provided." });
     }
 
-    const imagePath = 'uploads/' + req.file.filename;
+    const filename = 'profile_' + Date.now() + path.extname(req.file.originalname);
+    const imagePath = 'uploads/' + filename;
 
     try {
+        if (!supabase) {
+            return res.status(500).json({ message: "Supabase storage is not configured." });
+        }
+
+        const { data, error } = await supabase.storage
+            .from('profile-photo')
+            .upload(filename, req.file.buffer, {
+                contentType: req.file.mimetype,
+                upsert: true
+            });
+
+        if (error) {
+            console.error("Supabase upload error:", error);
+            return res.status(500).json({ message: "Failed to upload image to storage." });
+        }
+
         await db.query('UPDATE users SET profile_picture = $1 WHERE id = $2', [imagePath, userId]);
         res.status(200).json({
             message: "Profile picture updated successfully!",
@@ -384,10 +414,27 @@ app.post('/api/upload-record', uploadRecord.single('recordFile'), async (req, re
         return res.status(400).json({ message: "No file provided." });
     }
 
-    const filePath = 'uploads/' + req.file.filename;
+    const filename = 'record_' + Date.now() + path.extname(req.file.originalname);
+    const filePath = 'uploads/' + filename;
     const finalFileName = fileName || req.file.originalname;
 
     try {
+        if (!supabase) {
+            return res.status(500).json({ message: "Supabase storage is not configured." });
+        }
+
+        const { data, error } = await supabase.storage
+            .from('file-record')
+            .upload(filename, req.file.buffer, {
+                contentType: req.file.mimetype,
+                upsert: true
+            });
+
+        if (error) {
+            console.error("Supabase upload error:", error);
+            return res.status(500).json({ message: "Failed to upload file to storage." });
+        }
+
         const query = 'INSERT INTO patient_records (user_id, file_name, file_path) VALUES ($1, $2, $3)';
         await db.query(query, [userId, finalFileName, filePath]);
 
@@ -403,14 +450,46 @@ app.post('/api/upload-record', uploadRecord.single('recordFile'), async (req, re
 
 app.get('/api/patient-records/:userId', async (req, res) => {
     try {
-        const { rows: records } = await db.query(
-            'SELECT id, file_name, file_path, upload_date FROM patient_records WHERE user_id = $1 ORDER BY upload_date DESC',
-            [req.params.userId]
-        );
-        res.status(200).json(records);
+        const userId = req.params.userId;
+
+        // Query 1: Fetch all core file upload entries using columns guaranteed by the model
+        const recordsQuery = `
+            SELECT file_name, file_path, upload_date 
+            FROM patient_records 
+            WHERE user_id = $1 
+            ORDER BY upload_date DESC
+        `;
+        const { rows: records } = await db.query(recordsQuery, [userId]);
+
+        // Query 2: Fetch all AI diagnostics runs using columns guaranteed by the model
+        const diagnosticsQuery = `
+            SELECT ai_findings, clinical_notes, scan_date 
+            FROM ai_diagnostics 
+            WHERE patient_id = $1 
+            ORDER BY scan_date DESC
+        `;
+        const { rows: diagnostics } = await db.query(diagnosticsQuery, [userId]);
+
+        // Zip the arrays together by index positioning
+        const unifiedRecords = records.map((record, index) => {
+            // Fallback to empty values if there's a minor length mismatch
+            const diagnosticMatch = diagnostics[index] || {}; 
+            
+            return {
+                file_name: record.file_name,
+                file_path: record.file_path,
+                upload_date: record.upload_date,
+                ai_findings: diagnosticMatch.ai_findings || { predictions: [] },
+                clinical_notes: diagnosticMatch.clinical_notes || "No clinical advisory notes compiled."
+            };
+        });
+
+        // Send the unified list back to the React client code
+        res.status(200).json(unifiedRecords);
+
     } catch (err) {
-        console.error("Fetch Records Error:", err);
-        res.status(500).json({ message: "Failed to fetch patient records." });
+        console.error("❌ Critical Patient Records Processing Failure:", err);
+        res.status(500).json({ message: "Failed to assemble unified patient diagnostic history logs." });
     }
 });
 
